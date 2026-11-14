@@ -1,12 +1,12 @@
 use std::{net::SocketAddr, sync::Arc};
 
+use dtnpm_cla_ltp_kiss::{Config, LtpCla, TransportMode};
 use hardy_bpa::{
     async_trait,
     cla::{Acceptance, Cla, ClaAddress, Result as ClaResult, Segment, Sink, TransferOutcome},
     stream::Receiver,
 };
 use hardy_bpv7::{bundle::Id, eid::NodeId};
-use dtnpm_cla_ltp_kiss::{Config, LtpCla, TransportMode};
 
 /// A mock CLA Sink that accepts dispatches and reports.
 pub struct MockSink;

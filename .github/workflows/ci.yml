@@ -10,8 +10,62 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  test:
-    name: Workspace Tests (LTP + KISS CLA)
+  build-test-lint:
+    name: Workspace Tests (LTP + KISS CLA) & SBOM
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: dtn-postmaster/dtnpm-cla-ltp-kiss
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: dtn-postmaster/dtnpm-cla-ltp-kiss
+      - name: Formatting check
+        working-directory: dtn-postmaster/dtnpm-cla-ltp-kiss
+        run: cargo fmt --all -- --check
+      - name: Strict Clippy check (production targets)
+        working-directory: dtn-postmaster/dtnpm-cla-ltp-kiss
+        run: cargo clippy --workspace --lib --bins -- -D warnings -D clippy::unwrap_used -D clippy::panic
+      - name: Run workspace tests (excluding fuzz targets)
+        working-directory: dtn-postmaster/dtnpm-cla-ltp-kiss
+        run: cargo test --workspace --exclude dtnpm-cla-ltp-kiss-fuzz --exclude hardy-ltp-fuzz
+      - name: Generate CycloneDX / SPDX SBOM (Syft)
+        uses: anchore/sbom-action@v0
+        with:
+          path: dtn-postmaster/dtnpm-cla-ltp-kiss
+          output-file: dtn-postmaster/dtnpm-cla-ltp-kiss/sbom.json
+          format: cyclonedx-json
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-dtnpm-cla-ltp-kiss
+          path: dtn-postmaster/dtnpm-cla-ltp-kiss/sbom.json
+
+  security-audit:
+    name: Security & License Gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: dtn-postmaster/dtnpm-cla-ltp-kiss
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: dtn-postmaster/dtnpm-cla-ltp-kiss
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit, cargo-deny, gitleaks
+      - name: Run strict security checks
+        working-directory: dtn-postmaster/dtnpm-cla-ltp-kiss
+        run: ./scripts/check-security.sh --strict
+
+  code-coverage:
+    name: Code Coverage (LCOV)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -21,6 +75,29 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: dtn-postmaster/dtnpm-cla-ltp-kiss
-      - name: Run workspace tests (excluding fuzz targets)
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Generate LCOV coverage report
         working-directory: dtn-postmaster/dtnpm-cla-ltp-kiss
-        run: cargo test --workspace --exclude dtnpm-cla-ltp-kiss-fuzz --exclude hardy-ltp-fuzz
+        run: ./scripts/check-coverage.sh --lcov
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-dtnpm-cla-ltp-kiss
+          path: dtn-postmaster/dtnpm-cla-ltp-kiss/lcov.info
+
+  fuzz-smoke-tests:
+    name: Fuzzing Smoke Tests (30s per target)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: dtn-postmaster/dtnpm-cla-ltp-kiss
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: taiki-e/install-action@cargo-fuzz
+      - name: Run fuzz targets (smoke tests)
+        working-directory: dtn-postmaster/dtnpm-cla-ltp-kiss
+        run: |
+          cargo fuzz run --fuzz-dir fuzz cla_packet -- -max_total_time=30
+          cargo fuzz run --fuzz-dir ltp/fuzz engine_ops -- -max_total_time=30
+          cargo fuzz run --fuzz-dir ltp/fuzz sdnv_kiss -- -max_total_time=30
+          cargo fuzz run --fuzz-dir ltp/fuzz segment_decode -- -max_total_time=30
