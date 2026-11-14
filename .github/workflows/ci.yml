@@ -1,0 +1,26 @@
+# Expects sibling checkouts of dtnpm-core (`../dtnpm-core`) and hardy (`../../hardy`).
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Workspace Tests (LTP + KISS CLA)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: dtn-postmaster/dtnpm-cla-ltp-kiss
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: dtn-postmaster/dtnpm-cla-ltp-kiss
+      - name: Run workspace tests (excluding fuzz targets)
+        working-directory: dtn-postmaster/dtnpm-cla-ltp-kiss
+        run: cargo test --workspace --exclude dtnpm-cla-ltp-kiss-fuzz --exclude hardy-ltp-fuzz
