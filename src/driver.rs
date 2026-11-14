@@ -1,6 +1,6 @@
 //! Background runtime driver coordinating the LTP sans-I/O Engine with network I/O.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -53,28 +53,178 @@ pub enum DriverCommand {
     Shutdown,
 }
 
+const MAX_DYNAMIC_UDP_PEERS: usize = 256;
+const MAX_GREEN_REASSEMBLIES: usize = 64;
+const MAX_GREEN_BUNDLE_SIZE: usize = 16 * 1024 * 1024; // 16 MiB max green bundle
+const MAX_TOTAL_GREEN_BYTES: usize = 32 * 1024 * 1024; // 32 MiB global green buffer cap
+
 #[derive(Debug)]
 struct GreenReassembly {
     _source: EngineId,
-    data: Vec<u8>,
-    received_bytes: usize,
+    chunks: BTreeMap<usize, Vec<u8>>,
+    stored_bytes: usize,
     total_len: Option<usize>,
     last_update: Instant,
+}
+
+impl GreenReassembly {
+    fn new(source: EngineId, now: Instant) -> Self {
+        Self {
+            _source: source,
+            chunks: BTreeMap::new(),
+            stored_bytes: 0,
+            total_len: None,
+            last_update: now,
+        }
+    }
+
+    fn max_end_offset(&self) -> usize {
+        self.chunks
+            .last_key_value()
+            .map_or(0, |(&k, v)| k.saturating_add(v.len()))
+    }
+
+    /// Inserts a green slice, coalescing overlapping/adjacent chunks and enforcing global budget.
+    ///
+    /// Returns `Ok(())` on success or `Err(())` if global buffer cap would be exceeded.
+    fn insert(
+        &mut self,
+        offset: usize,
+        data: &[u8],
+        now: Instant,
+        total_green_bytes: &mut usize,
+    ) -> std::result::Result<(), ()> {
+        self.last_update = now;
+        if data.is_empty() {
+            return Ok(());
+        }
+        let end_offset = offset.checked_add(data.len()).ok_or(())?;
+
+        // Fast path: incoming slice is already completely covered by an existing chunk
+        if let Some((&prev_k, prev_v)) = self.chunks.range(..=offset).next_back()
+            && prev_k.saturating_add(prev_v.len()) >= end_offset
+        {
+            return Ok(());
+        }
+
+        let mut merged_start = offset;
+        let mut merged_end = end_offset;
+        let mut overlapping_keys = Vec::new();
+        let mut existing_bytes = 0usize;
+
+        if let Some((&prev_k, prev_v)) = self.chunks.range(..offset).next_back() {
+            let prev_end = prev_k.saturating_add(prev_v.len());
+            if prev_end >= offset {
+                merged_start = merged_start.min(prev_k);
+                merged_end = merged_end.max(prev_end);
+                overlapping_keys.push(prev_k);
+                existing_bytes = existing_bytes.saturating_add(prev_v.len());
+            }
+        }
+
+        for (&k, v) in self.chunks.range(offset..=end_offset) {
+            let v_end = k.saturating_add(v.len());
+            merged_end = merged_end.max(v_end);
+            overlapping_keys.push(k);
+            existing_bytes = existing_bytes.saturating_add(v.len());
+        }
+
+        let merged_len = merged_end.checked_sub(merged_start).ok_or(())?;
+        let net_added = merged_len.saturating_sub(existing_bytes);
+        if total_green_bytes.saturating_add(net_added) > MAX_TOTAL_GREEN_BYTES {
+            return Err(());
+        }
+
+        let new_chunk = if overlapping_keys.is_empty() {
+            data.to_vec()
+        } else {
+            let mut buf = vec![0u8; merged_len];
+            for key in overlapping_keys {
+                if let Some(old) = self.chunks.remove(&key) {
+                    self.stored_bytes = self.stored_bytes.saturating_sub(old.len());
+                    *total_green_bytes = total_green_bytes.saturating_sub(old.len());
+                    let rel = key - merged_start;
+                    buf[rel..rel + old.len()].copy_from_slice(&old);
+                }
+            }
+            let rel_new = offset - merged_start;
+            buf[rel_new..rel_new + data.len()].copy_from_slice(data);
+            buf
+        };
+
+        self.stored_bytes = self.stored_bytes.saturating_add(new_chunk.len());
+        *total_green_bytes = total_green_bytes.saturating_add(new_chunk.len());
+        self.chunks.insert(merged_start, new_chunk);
+        Ok(())
+    }
+
+    /// Returns true when `0..total_len` is completely and contiguously covered.
+    fn is_complete(&self) -> bool {
+        let Some(total) = self.total_len else {
+            return false;
+        };
+        if total == 0 {
+            return true;
+        }
+        let mut cursor = 0usize;
+        for (&start, chunk) in &self.chunks {
+            if start > cursor {
+                return false;
+            }
+            let end = start.saturating_add(chunk.len());
+            if end > cursor {
+                cursor = end;
+            }
+            if cursor >= total {
+                return cursor == total;
+            }
+        }
+        cursor == total
+    }
+
+    fn take_complete(&mut self, total_green_bytes: &mut usize) -> Option<Vec<u8>> {
+        if !self.is_complete() {
+            return None;
+        }
+        let total = self.total_len?;
+        let drained = std::mem::take(&mut self.chunks);
+        *total_green_bytes = total_green_bytes.saturating_sub(self.stored_bytes);
+        self.stored_bytes = 0;
+
+        if total == 0 {
+            return Some(Vec::new());
+        }
+        if drained.len() == 1
+            && let Some((start, buf)) = drained.into_iter().next()
+            && start == 0
+            && buf.len() == total
+        {
+            return Some(buf);
+        }
+
+        // Fallback linear copy (unreachable while coalesced, preserves general chunk invariant)
+        None
+    }
 }
 
 /// The background task running the LTP engine.
 pub struct Driver {
     config: Config,
+    allow_unauthenticated_udp: bool,
     engine: Engine,
     sink: Arc<dyn Sink>,
     tasks: Arc<TaskPool>,
     cmd_rx: mpsc::Receiver<DriverCommand>,
     start_time: Instant,
+    static_peers: HashMap<EngineId, SocketAddr>,
+    allow_ip_migration_peers: HashSet<EngineId>,
+    dynamic_peers: VecDeque<EngineId>,
     engine_to_addr: HashMap<EngineId, SocketAddr>,
     addr_to_engine: HashMap<SocketAddr, EngineId>,
     engine_to_node: HashMap<EngineId, NodeId>,
     pending_transfers: HashMap<SessionId, Id>,
     green_reassemblies: HashMap<SessionId, GreenReassembly>,
+    total_green_bytes: usize,
 }
 
 /// Minimum frame length required by standard packet radio TNCs (e.g. Direwolf).
@@ -95,7 +245,7 @@ pub fn pad_segment_for_tnc(bytes: &[u8], min_frame_len: usize) -> std::borrow::C
         let pad_len = min_frame_len.saturating_sub(cur_len + 2);
         let pad_zeros = vec![0u8; pad_len];
         seg.trailer_ext.push(Extension {
-            tag: 0,
+            tag: 0xFF,
             value: &pad_zeros,
         });
         let padded = seg.encode_to_vec();
@@ -204,6 +354,7 @@ impl Driver {
     /// Spawns the driver task based on configuration.
     pub fn spawn(
         config: Config,
+        allow_unauthenticated_udp: bool,
         sink: Arc<dyn Sink>,
         cmd_rx: mpsc::Receiver<DriverCommand>,
         addr_tx: oneshot::Sender<std::io::Result<SocketAddr>>,
@@ -222,7 +373,15 @@ impl Driver {
                 ..Default::default()
             };
             let mut engine = Engine::new(engine_cfg);
+            let mut static_peers = HashMap::new();
+            let mut allow_ip_migration_peers = HashSet::new();
             for peer in &config.peers {
+                if peer.allow_ip_migration {
+                    allow_ip_migration_peers.insert(peer.engine_id);
+                }
+                if let Some(addr) = peer.address {
+                    static_peers.insert(peer.engine_id, addr);
+                }
                 if let (Some(rtt), Some(ack_margin)) = (peer.rtt, peer.ack_margin) {
                     let rtt_micros = u64::try_from(rtt.as_micros()).unwrap_or(u64::MAX);
                     let ack_margin_micros =
@@ -233,16 +392,21 @@ impl Driver {
 
             let mut driver = Self {
                 config,
+                allow_unauthenticated_udp,
                 engine,
                 sink,
                 tasks,
                 cmd_rx,
                 start_time,
+                static_peers,
+                allow_ip_migration_peers,
+                dynamic_peers: VecDeque::new(),
                 engine_to_addr: HashMap::new(),
                 addr_to_engine: HashMap::new(),
                 engine_to_node: HashMap::new(),
                 pending_transfers: HashMap::new(),
                 green_reassemblies: HashMap::new(),
+                total_green_bytes: 0,
             };
 
             if let Err(err) = driver.run(addr_tx).await {
@@ -257,6 +421,25 @@ impl Driver {
                     .await;
             }
         })
+    }
+
+    fn remove_green_reassembly(&mut self, session: &SessionId) {
+        if let Some(removed) = self.green_reassemblies.remove(session) {
+            self.total_green_bytes = self.total_green_bytes.saturating_sub(removed.stored_bytes);
+        }
+    }
+
+    fn prune_expired_green_reassemblies(&mut self, max_age: Duration) {
+        let now = Instant::now();
+        let mut removed_bytes = 0usize;
+        self.green_reassemblies.retain(|_, r| {
+            let keep = now.duration_since(r.last_update) < max_age;
+            if !keep {
+                removed_bytes = removed_bytes.saturating_add(r.stored_bytes);
+            }
+            keep
+        });
+        self.total_green_bytes = self.total_green_bytes.saturating_sub(removed_bytes);
     }
 
     fn now_micros(&self) -> u64 {
@@ -371,47 +554,100 @@ impl Driver {
 
                     let now = self.now_micros();
 
-                    // Resolve peer engine ID using peek_session to avoid full allocation
-                    let peer_engine = if let Some(&id) = self.addr_to_engine.get(&peer_addr) {
-                        if self.engine_to_addr.contains_key(&id) {
-                            self.engine_to_addr.insert(id, peer_addr);
+                    // Always peek the LTP session header first so a cached socket address cannot
+                    // spoof a different peer's EngineId in Engine::handle_incoming_segment.
+                    let Ok(session) = Segment::peek_session(&rx_buf[..len]) else {
+                        trace!("discarding malformed UDP datagram from {peer_addr}");
+                        continue;
+                    };
+
+                    let peer_engine = if session.originator != self.config.engine_id {
+                        session.originator
+                    } else if let Some(peer) = self.engine.peer_for_session(&session) {
+                        peer
+                    } else if let Some(&cached) = self.addr_to_engine.get(&peer_addr) {
+                        cached
+                    } else if let (1, Some(&only_peer)) =
+                        (self.engine_to_addr.len(), self.engine_to_addr.keys().next())
+                    {
+                        only_peer
+                    } else {
+                        warn!("received packet from unregistered UDP peer {peer_addr}");
+                        continue;
+                    };
+
+                    if let Some(&static_addr) = self.static_peers.get(&peer_engine) {
+                        let allow_migration = self.allow_unauthenticated_udp
+                            || self.allow_ip_migration_peers.contains(&peer_engine);
+                        if static_addr.ip() != peer_addr.ip() && !allow_migration {
+                            warn!(
+                                "rejecting UDP segment for static Engine {:?} from mismatched IP {} (expected {})",
+                                peer_engine,
+                                peer_addr.ip(),
+                                static_addr.ip()
+                            );
+                            continue;
                         }
-                        id
-                    } else if let Ok(session) = Segment::peek_session(&rx_buf[..len]) {
-                        let id = if session.originator != self.config.engine_id {
-                            session.originator
-                        } else if let Some(peer) = self.engine.peer_for_session(&session) {
-                            peer
-                        } else if let (1, Some(&only_peer)) =
-                            (self.engine_to_addr.len(), self.engine_to_addr.keys().next())
+                        if self.addr_to_engine.len() >= 1024
+                            && !self.addr_to_engine.contains_key(&peer_addr)
                         {
-                            only_peer
-                        } else {
-                            warn!("received packet from unregistered UDP peer {peer_addr}");
-                            EngineId(peer_addr.port() as u64)
-                        };
-                        let is_new_peer = !self.engine_to_addr.contains_key(&id);
-                        if self.addr_to_engine.len() >= 1024 {
                             self.addr_to_engine.clear();
                         }
-                        self.addr_to_engine.insert(peer_addr, id);
-                        self.engine_to_addr.insert(id, peer_addr);
+                        self.addr_to_engine.insert(peer_addr, peer_engine);
+                        self.engine_to_addr.insert(peer_engine, peer_addr);
+                    } else if !self.allow_unauthenticated_udp {
+                        warn!(
+                            "rejecting UDP segment from unauthenticated dynamic Engine {:?} at {} (enable --allow-unauthenticated-udp to permit)",
+                            peer_engine, peer_addr
+                        );
+                        continue;
+                    } else {
+                        let is_new_peer = !self.engine_to_addr.contains_key(&peer_engine);
+                        if is_new_peer {
+                            if self.engine_to_addr.len() >= 1024 {
+                                self.engine_to_addr
+                                    .retain(|id, _| self.static_peers.contains_key(id));
+                                self.dynamic_peers.clear();
+                            }
+                            while self.dynamic_peers.len() >= MAX_DYNAMIC_UDP_PEERS {
+                                if let Some(evicted_id) = self.dynamic_peers.pop_front() {
+                                    if let Some(old_addr) = self.engine_to_addr.remove(&evicted_id)
+                                    {
+                                        self.addr_to_engine.remove(&old_addr);
+                                    }
+                                    let cla_addr = engine_id_to_cla_address(evicted_id);
+                                    let sink = self.sink.clone();
+                                    self.tasks.spawn(async move {
+                                        let _ = sink.remove_peer(&cla_addr).await;
+                                    });
+                                }
+                            }
+                            self.dynamic_peers.push_back(peer_engine);
+                        }
+                        if self.addr_to_engine.len() >= 1024
+                            && !self.addr_to_engine.contains_key(&peer_addr)
+                        {
+                            self.addr_to_engine.clear();
+                        }
+                        self.addr_to_engine.insert(peer_addr, peer_engine);
+                        self.engine_to_addr.insert(peer_engine, peer_addr);
 
                         if is_new_peer {
-                            info!("discovered new dynamic LTP peer Engine {id:?} at {peer_addr}");
-                            let cla_addr = engine_id_to_cla_address(id);
+                            info!(
+                                "discovered new dynamic LTP peer Engine {peer_engine:?} at {peer_addr}"
+                            );
+                            let cla_addr = engine_id_to_cla_address(peer_engine);
                             let sink = self.sink.clone();
                             self.tasks.spawn(async move {
                                 let _ = sink.add_peer(cla_addr, &[]).await;
                             });
                         }
-                        id
-                    } else {
-                        warn!("received packet from unregistered UDP peer {peer_addr}");
-                        EngineId(peer_addr.port() as u64)
-                    };
+                    }
 
-                    if let Err(err) = self.engine.handle_incoming_segment(peer_engine, &rx_buf[..len], now) {
+                    if let Err(err) =
+                        self.engine
+                            .handle_incoming_segment(peer_engine, &rx_buf[..len], now)
+                    {
                         trace!("failed to parse LTP segment from {peer_addr}: {err}");
                     }
                 }
@@ -753,6 +989,8 @@ impl Driver {
                 addr,
                 node_id,
             } => {
+                self.static_peers.insert(engine_id, addr);
+                self.dynamic_peers.retain(|&id| id != engine_id);
                 self.engine_to_addr.insert(engine_id, addr);
                 self.addr_to_engine.insert(addr, engine_id);
                 if let Some(node) = node_id {
@@ -761,6 +999,9 @@ impl Driver {
                 Ok(true)
             }
             DriverCommand::UnregisterPeer { engine_id } => {
+                self.static_peers.remove(&engine_id);
+                self.allow_ip_migration_peers.remove(&engine_id);
+                self.dynamic_peers.retain(|&id| id != engine_id);
                 if let Some(addr) = self.engine_to_addr.remove(&engine_id) {
                     self.addr_to_engine.remove(&addr);
                 }
@@ -879,8 +1120,26 @@ impl Driver {
                     let peer_node = self.engine_to_node.get(&source).cloned();
                     let peer_addr = engine_id_to_cla_address(source);
 
-                    if offset == 0 && eob {
+                    let Ok(offset_usize) = usize::try_from(offset) else {
+                        warn!(
+                            "Green segment offset {} exceeds platform address space; dropping",
+                            offset
+                        );
+                        self.remove_green_reassembly(&session);
+                        continue;
+                    };
+
+                    if offset_usize == 0 && eob {
                         // Single-segment green block (fast-path)
+                        self.remove_green_reassembly(&session);
+                        if data.len() > MAX_GREEN_BUNDLE_SIZE {
+                            warn!(
+                                "Green single-segment bundle size {} exceeds max size {}; dropping",
+                                data.len(),
+                                MAX_GREEN_BUNDLE_SIZE
+                            );
+                            continue;
+                        }
                         self.tasks.spawn(async move {
                             debug!(
                                 "delivering single-segment green bundle ({} bytes) from Engine {:?}",
@@ -894,18 +1153,13 @@ impl Driver {
                         });
                     } else {
                         // Multi-segment green block reassembly
-                        const MAX_GREEN_REASSEMBLIES: usize = 64;
-                        const MAX_GREEN_BUNDLE_SIZE: usize = 16 * 1024 * 1024; // 16 MiB max green bundle
-
-                        let end_offset = match (offset as usize).checked_add(data.len()) {
-                            Some(end) => end,
-                            None => {
-                                warn!(
-                                    "integer overflow in Green segment offset {}; dropping",
-                                    offset
-                                );
-                                continue;
-                            }
+                        let Some(end_offset) = offset_usize.checked_add(data.len()) else {
+                            warn!(
+                                "integer overflow in Green segment offset {}; dropping",
+                                offset
+                            );
+                            self.remove_green_reassembly(&session);
+                            continue;
                         };
 
                         if end_offset > MAX_GREEN_BUNDLE_SIZE {
@@ -913,18 +1167,15 @@ impl Driver {
                                 "Green segment session {:?} end offset {} exceeds max size {}; dropping",
                                 session, end_offset, MAX_GREEN_BUNDLE_SIZE
                             );
-                            self.green_reassemblies.remove(&session);
+                            self.remove_green_reassembly(&session);
                             continue;
                         }
 
                         if !self.green_reassemblies.contains_key(&session)
                             && self.green_reassemblies.len() >= MAX_GREEN_REASSEMBLIES
                         {
-                            // Evict the oldest or sweep expired reassemblies
-                            let now = Instant::now();
-                            self.green_reassemblies.retain(|_, r| {
-                                now.duration_since(r.last_update) < Duration::from_secs(60)
-                            });
+                            // Sweep expired reassemblies before rejecting new sessions
+                            self.prune_expired_green_reassemblies(Duration::from_secs(60));
                             if self.green_reassemblies.len() >= MAX_GREEN_REASSEMBLIES {
                                 warn!(
                                     "too many concurrent Green reassemblies; dropping new session {:?}",
@@ -934,56 +1185,62 @@ impl Driver {
                             }
                         }
 
-                        let entry = self.green_reassemblies.entry(session).or_insert_with(|| {
-                            GreenReassembly {
-                                _source: source,
-                                data: Vec::new(),
-                                received_bytes: 0,
-                                total_len: None,
-                                last_update: Instant::now(),
+                        let reassembly_result = {
+                            let now_inst = Instant::now();
+                            let entry = self
+                                .green_reassemblies
+                                .entry(session)
+                                .or_insert_with(|| GreenReassembly::new(source, now_inst));
+
+                            if entry.total_len.is_some_and(|total| end_offset > total)
+                                || (eob
+                                    && (entry.total_len.is_some_and(|prev| prev != end_offset)
+                                        || entry.max_end_offset() > end_offset))
+                            {
+                                Err("inconsistent Green EOB bounds")
+                            } else if entry
+                                .insert(offset_usize, &data, now_inst, &mut self.total_green_bytes)
+                                .is_err()
+                            {
+                                Err("global Green reassembly buffer cap (32 MiB) exceeded")
+                            } else {
+                                if eob {
+                                    entry.total_len = Some(end_offset);
+                                }
+                                Ok(entry.take_complete(&mut self.total_green_bytes))
                             }
-                        });
+                        };
 
-                        entry.last_update = Instant::now();
-                        if entry.data.len() < end_offset {
-                            entry.data.resize(end_offset, 0);
-                        }
-                        entry.data[offset as usize..end_offset].copy_from_slice(&data);
-                        entry.received_bytes += data.len();
-                        if eob {
-                            entry.total_len = Some(end_offset);
-                        }
-
-                        if let Some(total) = entry.total_len
-                            && entry.received_bytes >= total
-                            && entry.data.len() == total
-                        {
-                            let complete_data = std::mem::take(&mut entry.data);
-                            self.green_reassemblies.remove(&session);
-
-                            self.tasks.spawn(async move {
-                                debug!(
-                                    "delivering reassembled green bundle ({} bytes) from Engine {:?}",
-                                    complete_data.len(),
-                                    source
-                                );
-                                let mut bundle_stream = Bytes::from(complete_data);
-                                let _ = sink
-                                    .dispatch(
-                                        peer_node.as_ref(),
-                                        Some(&peer_addr),
-                                        &mut bundle_stream,
-                                    )
-                                    .await;
-                            });
+                        match reassembly_result {
+                            Err(reason) => {
+                                warn!("{reason} for session {:?}; dropping", session);
+                                self.remove_green_reassembly(&session);
+                                continue;
+                            }
+                            Ok(Some(complete_data)) => {
+                                self.green_reassemblies.remove(&session);
+                                self.tasks.spawn(async move {
+                                    debug!(
+                                        "delivering reassembled green bundle ({} bytes) from Engine {:?}",
+                                        complete_data.len(),
+                                        source
+                                    );
+                                    let mut bundle_stream = Bytes::from(complete_data);
+                                    let _ = sink
+                                        .dispatch(
+                                            peer_node.as_ref(),
+                                            Some(&peer_addr),
+                                            &mut bundle_stream,
+                                        )
+                                        .await;
+                                });
+                            }
+                            Ok(None) => {}
                         }
 
                         // Periodic cleanup of stale green reassemblies (older than 30s)
                         if self.green_reassemblies.len() > 128 {
-                            let now = Instant::now();
-                            self.green_reassemblies.retain(|_, r| {
-                                now.duration_since(r.last_update) < Duration::from_secs(30)
-                            });
+                            self.prune_expired_green_reassemblies(Duration::from_secs(30));
                         }
                     }
                 }
@@ -1114,5 +1371,79 @@ mod tests {
             !pacer.is_paused(tokio::time::Instant::now()),
             "Pacer should unpause after dwell time"
         );
+    }
+
+    #[test]
+    fn test_green_reassembly_out_of_order_overlap_and_gap_check() {
+        let now = Instant::now();
+        let mut total_bytes = 0usize;
+        let mut reassembly = GreenReassembly::new(EngineId(2), now);
+
+        // Out-of-order EOB arrives first at [20..30), gap at [0..20)
+        assert!(
+            reassembly
+                .insert(20, b"0123456789", now, &mut total_bytes)
+                .is_ok()
+        );
+        reassembly.total_len = Some(30);
+        assert_eq!(total_bytes, 10);
+        assert!(!reassembly.is_complete());
+
+        // Overlapping duplicate at [10..25) -> only 15 total unique bytes in [10..30)
+        // [10..25) overlaps [20..30), coalesced chunk is [10..30) = 20 bytes
+        assert!(
+            reassembly
+                .insert(10, b"ABCDEFGHIJ01234", now, &mut total_bytes)
+                .is_ok()
+        );
+        assert_eq!(total_bytes, 20);
+        assert_eq!(reassembly.stored_bytes, 20);
+        assert!(
+            !reassembly.is_complete(),
+            "gap [0..10) must prevent completion even after overlapping retransmissions"
+        );
+
+        // Re-sending overlapping [10..25) must NOT inflate total_bytes or trigger completion
+        assert!(
+            reassembly
+                .insert(10, b"ABCDEFGHIJ01234", now, &mut total_bytes)
+                .is_ok()
+        );
+        assert_eq!(total_bytes, 20);
+        assert!(!reassembly.is_complete());
+
+        // Missing prefix [0..10) arrives -> completes contiguously
+        assert!(
+            reassembly
+                .insert(0, b"0123456789", now, &mut total_bytes)
+                .is_ok()
+        );
+        assert_eq!(total_bytes, 30);
+        let assembled = reassembly
+            .take_complete(&mut total_bytes)
+            .expect("contiguous 0..30 must complete");
+        assert_eq!(assembled, b"0123456789ABCDEFGHIJ0123456789");
+        assert_eq!(total_bytes, 0);
+        assert_eq!(reassembly.stored_bytes, 0);
+    }
+
+    #[test]
+    fn test_green_reassembly_enforces_32mib_global_cap() {
+        let now = Instant::now();
+        let mut total_bytes = 0usize;
+        let chunk_16m = vec![0xABu8; 16 * 1024 * 1024];
+
+        let mut s1 = GreenReassembly::new(EngineId(2), now);
+        assert!(s1.insert(0, &chunk_16m, now, &mut total_bytes).is_ok());
+        assert_eq!(total_bytes, 16 * 1024 * 1024);
+
+        let mut s2 = GreenReassembly::new(EngineId(3), now);
+        assert!(s2.insert(0, &chunk_16m, now, &mut total_bytes).is_ok());
+        assert_eq!(total_bytes, MAX_TOTAL_GREEN_BYTES);
+
+        // Adding 1 more byte across any session must fail against 32 MiB cap
+        let mut s3 = GreenReassembly::new(EngineId(4), now);
+        assert!(s3.insert(0, b"X", now, &mut total_bytes).is_err());
+        assert_eq!(total_bytes, MAX_TOTAL_GREEN_BYTES);
     }
 }

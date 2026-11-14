@@ -485,7 +485,7 @@ impl Engine {
             // Already delivered. If this is a retransmitted checkpoint, re-emit an RS to silence the sender.
             if let Some(cp) = ds.kind.checkpoint() {
                 let cp_serial = cp.serial.get();
-                let upper_bound = ds.offset.saturating_add(ds.data.len() as u64);
+                let upper_bound = ds.offset.saturating_add(ds.data.len() as u64).max(1);
                 let report_seg = ReportSegment {
                     report_serial: NonZeroU64::new(1).expect("non zero"),
                     checkpoint_serial: cp_serial,
@@ -512,13 +512,19 @@ impl Engine {
             return;
         }
 
+        let Some(seg_end) = ds.offset.checked_add(ds.data.len() as u64) else {
+            return;
+        };
+
         // Cancel isolation: if session exists and is already cancelling, ignore data
         if let Some(existing) = self.recv_sessions.get(&session_id) {
             if existing.cancel_reason.is_some() {
                 return;
             }
-        } else if self.recv_sessions.len() >= self.config.max_recv_sessions {
-            // DoS protection: reject new sessions when capacity is exhausted
+        } else if self.recv_sessions.len() >= self.config.max_recv_sessions
+            || seg_end > self.config.max_block_size
+        {
+            // DoS protection: reject new sessions when capacity is exhausted or segment exceeds max_block_size
             return;
         }
 
@@ -545,7 +551,6 @@ impl Engine {
         }
 
         // RFC 5326 §6.21: Red/green ordering violation checks (Miscolored)
-        let seg_end = ds.offset.saturating_add(ds.data.len() as u64);
         if ds.kind.is_red() {
             if session.red_part_len.is_some_and(|r| seg_end > r)
                 || session.min_green_offset.is_some_and(|g| seg_end > g)
@@ -782,6 +787,7 @@ impl Engine {
             session.cancel_reason = Some(reason);
             session.cancel_retries = 1;
             self.record_cancelled(session_id);
+            self.timer_table.cancel_session(session_id);
 
             let cr = Segment {
                 session: session_id,
@@ -809,6 +815,7 @@ impl Engine {
             session.cancel_reason = Some(reason);
             session.cancel_retries = 1;
             self.record_cancelled(session_id);
+            self.timer_table.cancel_session(session_id);
 
             let cs = Segment {
                 session: session_id,
@@ -1346,6 +1353,8 @@ impl Engine {
             let peer = session.peer;
             session.cancel_reason = Some(CancelReason::Rlexc);
             session.cancel_retries = 1;
+            self.record_cancelled(session_id);
+            self.timer_table.cancel_session(session_id);
 
             let cr = Segment {
                 session: session_id,

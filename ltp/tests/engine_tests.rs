@@ -2508,3 +2508,226 @@ fn test_s49_karns_algorithm_ignores_retransmitted_checkpoints() {
         "retransmitted report must not update receiver RTT"
     );
 }
+
+#[test]
+fn test_oversized_new_session_does_not_exhaust_recv_capacity() {
+    let mut receiver = Engine::new(EngineConfig {
+        engine_id: EngineId(2),
+        max_recv_sessions: 2,
+        max_block_size: 1024,
+        ..Default::default()
+    });
+
+    // Send 10 oversized/overflowing segments for distinct session IDs
+    for i in 1..=10 {
+        let offset = if i % 2 == 0 { u64::MAX - 2 } else { 2048 };
+        let bad_seg = hardy_ltp::segment::Segment {
+            session: SessionId {
+                originator: EngineId(1),
+                number: i,
+            },
+            header_ext: Vec::new(),
+            trailer_ext: Vec::new(),
+            body: hardy_ltp::segment::SegmentBody::Data(hardy_ltp::segment::DataSegment {
+                client_service: 1,
+                offset,
+                kind: hardy_ltp::segment::DataSegKind::Red,
+                data: b"attack",
+            }),
+        };
+        receiver
+            .handle_incoming_segment(EngineId(1), &bad_seg.encode_to_vec(), 1_000)
+            .unwrap();
+    }
+
+    // Valid new session must still succeed because none of the oversized segments allocated state
+    let valid_seg = hardy_ltp::segment::Segment {
+        session: SessionId {
+            originator: EngineId(1),
+            number: 99,
+        },
+        header_ext: Vec::new(),
+        trailer_ext: Vec::new(),
+        body: hardy_ltp::segment::SegmentBody::Data(hardy_ltp::segment::DataSegment {
+            client_service: 1,
+            offset: 0,
+            kind: hardy_ltp::segment::DataSegKind::RedCpEorpEob(hardy_ltp::segment::Checkpoint {
+                serial: core::num::NonZeroU64::new(1).unwrap(),
+                report_serial: 0,
+            }),
+            data: b"VALID",
+        }),
+    };
+    receiver
+        .handle_incoming_segment(EngineId(1), &valid_seg.encode_to_vec(), 2_000)
+        .unwrap();
+
+    let mut delivered = false;
+    while let Some(notice) = receiver.poll_notice() {
+        if matches!(notice, hardy_ltp::engine::Notice::RedPartReceived { data, .. } if data == b"VALID")
+        {
+            delivered = true;
+        }
+    }
+    assert!(
+        delivered,
+        "valid session must not be crowded out by oversized segments"
+    );
+}
+
+#[test]
+fn test_closed_session_zero_length_cp_emits_valid_report() {
+    let mut receiver = Engine::new(EngineConfig {
+        engine_id: EngineId(2),
+        ..Default::default()
+    });
+    let session_id = SessionId {
+        originator: EngineId(1),
+        number: 77,
+    };
+
+    // Deliver and close session normally
+    let cp_seg = hardy_ltp::segment::Segment {
+        session: session_id,
+        header_ext: Vec::new(),
+        trailer_ext: Vec::new(),
+        body: hardy_ltp::segment::SegmentBody::Data(hardy_ltp::segment::DataSegment {
+            client_service: 1,
+            offset: 0,
+            kind: hardy_ltp::segment::DataSegKind::RedCpEorpEob(hardy_ltp::segment::Checkpoint {
+                serial: core::num::NonZeroU64::new(1).unwrap(),
+                report_serial: 0,
+            }),
+            data: b"HELLO",
+        }),
+    };
+    receiver
+        .handle_incoming_segment(EngineId(1), &cp_seg.encode_to_vec(), 1_000)
+        .unwrap();
+    while receiver.poll_output().is_some() {}
+    while receiver.poll_notice().is_some() {}
+
+    let ra = hardy_ltp::segment::Segment {
+        session: session_id,
+        header_ext: Vec::new(),
+        trailer_ext: Vec::new(),
+        body: hardy_ltp::segment::SegmentBody::ReportAck { report_serial: 1 },
+    };
+    receiver
+        .handle_incoming_segment(EngineId(1), &ra.encode_to_vec(), 2_000)
+        .unwrap();
+    while receiver.poll_output().is_some() {}
+
+    // Retransmitted zero-length CP on closed session must yield upper_bound >= 1 and valid RS wire format
+    let zero_cp = hardy_ltp::segment::Segment {
+        session: session_id,
+        header_ext: Vec::new(),
+        trailer_ext: Vec::new(),
+        body: hardy_ltp::segment::SegmentBody::Data(hardy_ltp::segment::DataSegment {
+            client_service: 1,
+            offset: 0,
+            kind: hardy_ltp::segment::DataSegKind::RedCpEorpEob(hardy_ltp::segment::Checkpoint {
+                serial: core::num::NonZeroU64::new(2).unwrap(),
+                report_serial: 0,
+            }),
+            data: b"",
+        }),
+    };
+    receiver
+        .handle_incoming_segment(EngineId(1), &zero_cp.encode_to_vec(), 3_000)
+        .unwrap();
+
+    let (_peer, rs_bytes) = receiver
+        .poll_output()
+        .expect("closed session must emit RS for duplicate CP");
+    let (decoded, _) = hardy_ltp::segment::Segment::parse(&rs_bytes)
+        .expect("closed session RS with cp_end == 0 must be valid RFC 5326 ReportSegment");
+    match decoded.body {
+        hardy_ltp::segment::SegmentBody::Report(rs) => {
+            assert_eq!(rs.lower_bound, 0);
+            assert!(rs.upper_bound >= 1);
+            assert_eq!(rs.claims.len(), 1);
+            assert_eq!(rs.claims[0].length, rs.upper_bound);
+        }
+        other => panic!("expected Report segment, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_rs_timeout_cancels_and_records_cancelled_session() {
+    let mut receiver = Engine::new(EngineConfig {
+        engine_id: EngineId(2),
+        rtt_micros: 100_000,
+        ack_margin_micros: 0,
+        report_rtx_limit: 0,
+        session_inactivity_timeout_micros: 1_000_000,
+        ..Default::default()
+    });
+    let session_id = SessionId {
+        originator: EngineId(1),
+        number: 88,
+    };
+
+    let cp_seg = hardy_ltp::segment::Segment {
+        session: session_id,
+        header_ext: Vec::new(),
+        trailer_ext: Vec::new(),
+        body: hardy_ltp::segment::SegmentBody::Data(hardy_ltp::segment::DataSegment {
+            client_service: 1,
+            offset: 0,
+            kind: hardy_ltp::segment::DataSegKind::RedCp(hardy_ltp::segment::Checkpoint {
+                serial: core::num::NonZeroU64::new(1).unwrap(),
+                report_serial: 0,
+            }),
+            data: b"PART",
+        }),
+    };
+    receiver
+        .handle_incoming_segment(EngineId(1), &cp_seg.encode_to_vec(), 1_000)
+        .unwrap();
+    while receiver.poll_output().is_some() {}
+    while receiver.poll_notice().is_some() {}
+
+    // Expire RS timer -> report_rtx_limit == 0 immediately cancels receiver session
+    receiver.handle_timer_tick(200_000);
+    let mut saw_cr = false;
+    while let Some((_peer, raw)) = receiver.poll_output() {
+        let (seg, _) = hardy_ltp::segment::Segment::parse(&raw).unwrap();
+        if matches!(
+            seg.body,
+            hardy_ltp::segment::SegmentBody::CancelReceiver { .. }
+        ) {
+            saw_cr = true;
+        }
+    }
+    assert!(saw_cr, "RS exhaustion must emit CancelReceiver");
+
+    // Exhaust cancel retries so session is fully removed from recv_sessions
+    for i in 1..=20u64 {
+        receiver.handle_timer_tick(200_000 + i * 200_000);
+        while receiver.poll_output().is_some() {}
+    }
+
+    // Late data segment must be dropped by cancelled_sessions_set isolation
+    let late_seg = hardy_ltp::segment::Segment {
+        session: session_id,
+        header_ext: Vec::new(),
+        trailer_ext: Vec::new(),
+        body: hardy_ltp::segment::SegmentBody::Data(hardy_ltp::segment::DataSegment {
+            client_service: 1,
+            offset: 4,
+            kind: hardy_ltp::segment::DataSegKind::RedCpEorpEob(hardy_ltp::segment::Checkpoint {
+                serial: core::num::NonZeroU64::new(2).unwrap(),
+                report_serial: 0,
+            }),
+            data: b"LATE",
+        }),
+    };
+    receiver
+        .handle_incoming_segment(EngineId(1), &late_seg.encode_to_vec(), 10_000_000)
+        .unwrap();
+    assert!(
+        receiver.poll_output().is_none(),
+        "late segment on RS-cancelled session must not emit RS"
+    );
+}

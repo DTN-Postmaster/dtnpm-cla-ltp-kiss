@@ -1959,7 +1959,7 @@ async fn test_dynamic_peer_discovery_registers_with_sink() {
         peers: Vec::new(), // No pre-configured peers
         ..Default::default()
     };
-    let cla = LtpCla::new(cfg);
+    let cla = LtpCla::new(cfg).with_allow_unauthenticated_udp(true);
     cla.on_register(sink, &[], None).await;
     let local_addr = cla.local_addr().await.unwrap();
 
@@ -2152,6 +2152,7 @@ async fn test_dynamic_peer_timing_geo_and_cislunar() {
             node_id: None,
             rtt: Some(Duration::from_millis(500)),
             ack_margin: Some(Duration::from_millis(200)),
+            ..Default::default()
         }],
         ..Default::default()
     };
@@ -2162,6 +2163,7 @@ async fn test_dynamic_peer_timing_geo_and_cislunar() {
     );
     assert_eq!(cla_1.peer_timing(EngineId(999)).await, None);
     cla_1.on_register(sink_1, &[], None).await;
+    let addr_1 = cla_1.local_addr().await.unwrap();
 
     // Node 2 listening
     let cfg_2 = Config {
@@ -2175,6 +2177,10 @@ async fn test_dynamic_peer_timing_geo_and_cislunar() {
     let cla_2 = LtpCla::new(cfg_2);
     cla_2.on_register(sink_2, &[], None).await;
     let addr_2 = cla_2.local_addr().await.unwrap();
+    cla_2
+        .register_peer(EngineId(1), addr_1, None)
+        .await
+        .unwrap();
 
     // Dynamically update peer 2's socket address and re-tune to Cislunar timing (RTT = 3.0s, ack_margin = 1.0s)
     cla_1
@@ -2251,6 +2257,8 @@ fn test_pad_segment_for_tnc_minimum_size() {
     assert!(padded_ra.len() >= 15);
     let (parsed_ra, consumed_ra) = LtpSegment::parse(&padded_ra).unwrap();
     assert_eq!(consumed_ra, padded_ra.len());
+    assert_eq!(parsed_ra.trailer_ext.len(), 1);
+    assert_eq!(parsed_ra.trailer_ext[0].tag, 0xFF);
     match parsed_ra.body {
         SegmentBody::ReportAck { report_serial } => assert_eq!(report_serial, 100),
         other => panic!("expected ReportAck, got {other:?}"),
@@ -2689,4 +2697,365 @@ async fn test_kiss_tcp_half_duplex_fixed_dwell() {
 
     cla_1.unregister().await;
     cla_2.unregister().await;
+}
+
+#[tokio::test]
+async fn test_udp_unauthenticated_unknown_peer_rejected_by_default() {
+    let (peer_tx, mut peer_rx) = mpsc::channel(16);
+    let sink = Box::new(PeerTrackingSink {
+        peers_added: peer_tx,
+        peers_removed: None,
+    });
+
+    let cfg = Config {
+        engine_id: EngineId(1),
+        transport: TransportMode::Udp {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+        },
+        peers: Vec::new(),
+        ..Default::default()
+    };
+    let cla = LtpCla::new(cfg); // allow_unauthenticated_udp defaults to false
+    cla.on_register(sink, &[], None).await;
+    let local_addr = cla.local_addr().await.unwrap();
+
+    let unknown_seg = LtpSegment {
+        session: SessionId {
+            originator: EngineId(77),
+            number: 1,
+        },
+        header_ext: Vec::new(),
+        trailer_ext: Vec::new(),
+        body: SegmentBody::Data(DataSegment {
+            client_service: 1,
+            offset: 0,
+            kind: DataSegKind::RedCpEorpEob(Checkpoint {
+                serial: NonZeroU64::new(1).unwrap(),
+                report_serial: 0,
+            }),
+            data: b"SPOOFED",
+        }),
+    };
+    let attacker_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    attacker_sock
+        .send_to(&unknown_seg.encode_to_vec(), local_addr)
+        .await
+        .unwrap();
+
+    // Unknown peer must neither trigger add_peer nor receive an RS response
+    let res = tokio::time::timeout(Duration::from_millis(250), peer_rx.recv()).await;
+    assert!(
+        res.is_err(),
+        "unauthenticated unknown UDP peer must not be discovered when opt-in is disabled"
+    );
+
+    let mut buf = [0u8; 256];
+    let rs = tokio::time::timeout(
+        Duration::from_millis(200),
+        attacker_sock.recv_from(&mut buf),
+    )
+    .await;
+    assert!(
+        rs.is_err(),
+        "unauthenticated unknown UDP peer must not receive RS reply"
+    );
+
+    cla.unregister().await;
+}
+
+#[tokio::test]
+async fn test_udp_cross_ip_spoofing_rejected_by_default() {
+    let (disp_tx, mut disp_rx) = mpsc::channel(16);
+    let (outc_tx, _outc_rx) = mpsc::channel(16);
+    let sink = Box::new(MockSink {
+        dispatches: disp_tx,
+        outcomes: outc_tx,
+    });
+
+    let cfg = Config {
+        engine_id: EngineId(1),
+        transport: TransportMode::Udp {
+            bind_addr: "0.0.0.0:0".parse().unwrap(),
+        },
+        rtt: Duration::from_millis(50),
+        ack_margin: Duration::from_millis(25),
+        peers: vec![PeerEntry {
+            engine_id: EngineId(2),
+            address: Some("127.0.0.1:9".parse().unwrap()),
+            allow_ip_migration: false,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let cla = LtpCla::new(cfg);
+    cla.on_register(sink, &[], None).await;
+    let bound = cla.local_addr().await.unwrap();
+    let target_addr: std::net::SocketAddr = format!("127.0.0.1:{}", bound.port()).parse().unwrap();
+
+    // Attacker bound on distinct loopback IP 127.0.0.2 spoofs EngineId(2)
+    let spoof_sock = UdpSocket::bind("127.0.0.2:0").await.unwrap();
+    let spoof_seg = LtpSegment {
+        session: SessionId {
+            originator: EngineId(2),
+            number: 500,
+        },
+        header_ext: Vec::new(),
+        trailer_ext: Vec::new(),
+        body: SegmentBody::Data(DataSegment {
+            client_service: 1,
+            offset: 0,
+            kind: DataSegKind::RedCpEorpEob(Checkpoint {
+                serial: NonZeroU64::new(1).unwrap(),
+                report_serial: 0,
+            }),
+            data: b"SPOOFED_CROSS_IP",
+        }),
+    };
+    spoof_sock
+        .send_to(&spoof_seg.encode_to_vec(), target_addr)
+        .await
+        .unwrap();
+
+    // Spoofed packet from 127.0.0.2 must not dispatch or get an RS back
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), disp_rx.recv())
+            .await
+            .is_err(),
+        "cross-IP spoofed segment must be rejected by default"
+    );
+    let mut rx_buf = [0u8; 512];
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(200),
+            spoof_sock.recv_from(&mut rx_buf)
+        )
+        .await
+        .is_err(),
+        "cross-IP spoofed source must not overwrite engine_to_addr"
+    );
+
+    // Legitimate peer on expected IP 127.0.0.1 (different port) still succeeds
+    let legit_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let legit_seg = LtpSegment {
+        session: SessionId {
+            originator: EngineId(2),
+            number: 501,
+        },
+        header_ext: Vec::new(),
+        trailer_ext: Vec::new(),
+        body: SegmentBody::Data(DataSegment {
+            client_service: 1,
+            offset: 0,
+            kind: DataSegKind::RedCpEorpEob(Checkpoint {
+                serial: NonZeroU64::new(1).unwrap(),
+                report_serial: 0,
+            }),
+            data: b"LEGIT_SAME_IP",
+        }),
+    };
+    legit_sock
+        .send_to(&legit_seg.encode_to_vec(), target_addr)
+        .await
+        .unwrap();
+
+    let (_, _, delivered) = tokio::time::timeout(Duration::from_secs(3), disp_rx.recv())
+        .await
+        .expect("timeout")
+        .expect("legit same-IP packet must dispatch");
+    assert_eq!(&delivered[..], b"LEGIT_SAME_IP");
+
+    let (n, _) = tokio::time::timeout(Duration::from_secs(3), legit_sock.recv_from(&mut rx_buf))
+        .await
+        .expect("timeout")
+        .unwrap();
+    let (rs, _) = LtpSegment::parse(&rx_buf[..n]).unwrap();
+    assert!(matches!(rs.body, SegmentBody::Report(_)));
+
+    cla.unregister().await;
+}
+
+#[tokio::test]
+async fn test_udp_cross_ip_migration_allowed_when_opted_in() {
+    let (disp_tx, mut disp_rx) = mpsc::channel(16);
+    let (outc_tx, _outc_rx) = mpsc::channel(16);
+    let sink = Box::new(MockSink {
+        dispatches: disp_tx,
+        outcomes: outc_tx,
+    });
+
+    let cfg = Config {
+        engine_id: EngineId(1),
+        transport: TransportMode::Udp {
+            bind_addr: "0.0.0.0:0".parse().unwrap(),
+        },
+        rtt: Duration::from_millis(50),
+        ack_margin: Duration::from_millis(25),
+        peers: vec![PeerEntry {
+            engine_id: EngineId(2),
+            address: Some("127.0.0.1:9".parse().unwrap()),
+            allow_ip_migration: true,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let cla = LtpCla::new(cfg);
+    cla.on_register(sink, &[], None).await;
+    let bound = cla.local_addr().await.unwrap();
+    let target_addr: std::net::SocketAddr = format!("127.0.0.1:{}", bound.port()).parse().unwrap();
+
+    let migrated_sock = UdpSocket::bind("127.0.0.2:0").await.unwrap();
+    let seg = LtpSegment {
+        session: SessionId {
+            originator: EngineId(2),
+            number: 600,
+        },
+        header_ext: Vec::new(),
+        trailer_ext: Vec::new(),
+        body: SegmentBody::Data(DataSegment {
+            client_service: 1,
+            offset: 0,
+            kind: DataSegKind::RedCpEorpEob(Checkpoint {
+                serial: NonZeroU64::new(1).unwrap(),
+                report_serial: 0,
+            }),
+            data: b"MIGRATED_PEER",
+        }),
+    };
+    migrated_sock
+        .send_to(&seg.encode_to_vec(), target_addr)
+        .await
+        .unwrap();
+
+    let (_, _, delivered) = tokio::time::timeout(Duration::from_secs(3), disp_rx.recv())
+        .await
+        .expect("timeout")
+        .expect("allow_ip_migration peer must dispatch");
+    assert_eq!(&delivered[..], b"MIGRATED_PEER");
+
+    let mut rx_buf = [0u8; 512];
+    let (n, _) = tokio::time::timeout(Duration::from_secs(3), migrated_sock.recv_from(&mut rx_buf))
+        .await
+        .expect("timeout")
+        .unwrap();
+    let (rs, _) = LtpSegment::parse(&rx_buf[..n]).unwrap();
+    assert!(matches!(rs.body, SegmentBody::Report(_)));
+
+    cla.unregister().await;
+}
+
+#[tokio::test]
+async fn test_udp_dynamic_peer_cap_256_evicts_oldest() {
+    let (add_tx, mut add_rx) = mpsc::channel(512);
+    let (rem_tx, mut rem_rx) = mpsc::channel(64);
+    let sink = Box::new(PeerTrackingSink {
+        peers_added: add_tx,
+        peers_removed: Some(rem_tx),
+    });
+
+    let cfg = Config {
+        engine_id: EngineId(1),
+        transport: TransportMode::Udp {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+        },
+        peers: Vec::new(),
+        ..Default::default()
+    };
+    let cla = LtpCla::new(cfg).with_allow_unauthenticated_udp(true);
+    cla.on_register(sink, &[], None).await;
+    let local_addr = cla.local_addr().await.unwrap();
+
+    let client_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    for engine_num in 1000..1260u64 {
+        let seg = LtpSegment {
+            session: SessionId {
+                originator: EngineId(engine_num),
+                number: 1,
+            },
+            header_ext: Vec::new(),
+            trailer_ext: Vec::new(),
+            body: SegmentBody::Data(DataSegment {
+                client_service: 1,
+                offset: 0,
+                kind: DataSegKind::GreenEob,
+                data: b"DYN",
+            }),
+        };
+        client_sock
+            .send_to(&seg.encode_to_vec(), local_addr)
+            .await
+            .unwrap();
+    }
+
+    // 260 dynamic discoveries -> oldest 4 (1000..1004) must be evicted to enforce 256 cap
+    for _ in 0..260 {
+        tokio::time::timeout(Duration::from_secs(5), add_rx.recv())
+            .await
+            .expect("timeout waiting for add_peer")
+            .expect("add_peer closed");
+    }
+
+    let mut removed = Vec::new();
+    for _ in 0..4 {
+        let addr = tokio::time::timeout(Duration::from_secs(5), rem_rx.recv())
+            .await
+            .expect("timeout waiting for dynamic peer eviction")
+            .expect("remove_peer closed");
+        removed.push(addr);
+    }
+    assert_eq!(
+        removed,
+        vec![
+            engine_id_to_cla_address(EngineId(1000)),
+            engine_id_to_cla_address(EngineId(1001)),
+            engine_id_to_cla_address(EngineId(1002)),
+            engine_id_to_cla_address(EngineId(1003)),
+        ]
+    );
+
+    cla.unregister().await;
+}
+
+#[tokio::test]
+async fn test_unregister_peer_clears_tcp_mapping_too() {
+    let (disp_tx, _disp_rx) = mpsc::channel(16);
+    let (outc_tx, _outc_rx) = mpsc::channel(16);
+    let sink = Box::new(MockSink {
+        dispatches: disp_tx,
+        outcomes: outc_tx,
+    });
+
+    let cfg = Config {
+        engine_id: EngineId(1),
+        transport: TransportMode::Udp {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+        },
+        ..Default::default()
+    };
+    let cla = LtpCla::new(cfg);
+    cla.on_register(sink, &[], None).await;
+
+    let peer_addr: std::net::SocketAddr = "127.0.0.1:45555".parse().unwrap();
+    cla.register_peer(EngineId(55), peer_addr, None)
+        .await
+        .unwrap();
+    cla.unregister_peer(EngineId(55)).await.unwrap();
+
+    let bundle_id = create_test_bundle_id("unregistered-tcp");
+    let mut stream = Bytes::from_static(b"PAYLOAD");
+    let res = cla
+        .forward(
+            None,
+            &ClaAddress::Tcp(peer_addr),
+            &bundle_id,
+            7,
+            &mut stream,
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(res, ForwardBundleResult::NoNeighbour),
+        "unregister_peer must remove ClaAddress::Tcp mapping as well as ClaAddress::Private"
+    );
+
+    cla.unregister().await;
 }

@@ -30,9 +30,33 @@ struct Args {
     #[arg(long, env = "DTN_HDY_TOKEN")]
     token: Option<String>,
 
+    /// Path to a file containing the Bearer authentication token for protected gRPC BPA endpoints
+    #[arg(long, env = "DTN_HDY_TOKEN_FILE", value_name = "PATH")]
+    token_file: Option<PathBuf>,
+
     /// Optional Unix Domain Socket path for connecting to a protected local BPA
     #[arg(long, env = "DTN_HDY_SOCKET")]
     socket: Option<String>,
+
+    /// Allow unauthenticated dynamic UDP peers and cross-IP peer migrations (unsafe on untrusted networks)
+    #[arg(long, env = "DTN_LTP_ALLOW_UNAUTHENTICATED_UDP")]
+    allow_unauthenticated_udp: bool,
+}
+
+fn resolve_auth_token(
+    token: Option<String>,
+    token_file: Option<&PathBuf>,
+) -> anyhow::Result<Option<String>> {
+    if let Some(path) = token_file {
+        let raw = std::fs::read_to_string(path)
+            .with_context(|| format!("Failed to read token file {}", path.display()))?;
+        let trimmed = raw.trim().to_string();
+        if trimmed.is_empty() {
+            anyhow::bail!("Token file {} is empty", path.display());
+        }
+        return Ok(Some(trimmed));
+    }
+    Ok(token)
 }
 
 fn load_config(path: Option<&PathBuf>) -> anyhow::Result<Config> {
@@ -43,7 +67,7 @@ fn load_config(path: Option<&PathBuf>) -> anyhow::Result<Config> {
         .with_context(|| format!("Failed to read config file {}", path.display()))?;
     match path.extension().and_then(|e| e.to_str()) {
         Some("toml") => toml::from_str(&raw).context("Invalid TOML config"),
-        _ => serde_yaml::from_str(&raw).context("Invalid YAML config"),
+        _ => yaml_serde::from_str(&raw).context("Invalid YAML config"),
     }
 }
 
@@ -55,6 +79,7 @@ async fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
     let cfg = load_config(args.config.as_ref())?;
+    let auth_token = resolve_auth_token(args.token, args.token_file.as_ref())?;
     let grpc_addr = args
         .bpa_grpc
         .unwrap_or_else(|| format!("http://127.0.0.1:{}", resolve_grpc_port(None)));
@@ -62,10 +87,11 @@ async fn main() -> anyhow::Result<()> {
     info!(name = %args.name, grpc = %grpc_addr, "Starting dtnpm-cla-ltp-kiss");
     let client = Arc::new(GrpcBpaClient::with_auth(
         &grpc_addr,
-        args.token.as_deref(),
+        auth_token.as_deref(),
         args.socket.as_deref(),
     ));
-    let cla = Arc::new(LtpCla::new(cfg));
+    let cla =
+        Arc::new(LtpCla::new(cfg).with_allow_unauthenticated_udp(args.allow_unauthenticated_udp));
     let init = cla.cla_init();
 
     let node_ids = client

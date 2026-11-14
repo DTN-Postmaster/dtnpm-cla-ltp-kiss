@@ -78,6 +78,11 @@ pub struct PeerEntry {
     /// Extra margin added to retransmission timers for this peer.
     #[cfg_attr(feature = "serde", serde(default))]
     pub ack_margin: Option<Duration>,
+    /// Allow this peer's source IP address to change dynamically over UDP.
+    ///
+    /// Disabled by default (`false`) to prevent cross-IP spoofing and routing hijacks.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub allow_ip_migration: bool,
 }
 
 impl Default for PeerEntry {
@@ -88,6 +93,7 @@ impl Default for PeerEntry {
             node_id: None,
             rtt: None,
             ack_margin: None,
+            allow_ip_migration: false,
         }
     }
 }
@@ -354,7 +360,7 @@ turnaround-mode: fixed-dwell
 turnaround-timeout: 4s
 dwell-time: 750ms
 "#;
-        let transport: TransportMode = serde_yaml::from_str(yaml_str).unwrap();
+        let transport: TransportMode = yaml_serde::from_str(yaml_str).unwrap();
         match transport {
             TransportMode::KissTcp {
                 server_addr,

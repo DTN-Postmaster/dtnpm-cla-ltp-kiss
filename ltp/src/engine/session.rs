@@ -214,36 +214,96 @@ impl RecvSession {
 
         self.max_red_end = self.max_red_end.max(end);
 
+        if data.is_empty() {
+            return true;
+        }
+
         if start_idx <= self.red_buf.len() {
             // Contiguous or partially overlapping with existing buffer
             if end_idx > self.red_buf.len() {
                 self.red_buf.resize(end_idx, 0);
             }
-            self.red_buf[start_idx..end_idx].copy_from_slice(data);
-            self.red_received.insert(offset..end);
 
-            // Connect any sparse segments that are now adjacent to red_buf
+            // Connect any sparse segments that are now adjacent to red_buf before writing new slice
             while let Some((&sp_offset, _)) = self.sparse_red.first_key_value() {
-                if (sp_offset as usize) <= self.red_buf.len() {
-                    let (_, sp_bytes) = self.sparse_red.pop_first().expect("non-empty");
+                let Ok(sp_start) = usize::try_from(sp_offset) else {
+                    break;
+                };
+                if sp_start <= self.red_buf.len() {
+                    let Some((_, sp_bytes)) = self.sparse_red.pop_first() else {
+                        break;
+                    };
                     self.total_received_bytes =
                         self.total_received_bytes.saturating_sub(sp_bytes.len());
-                    let sp_end = (sp_offset as usize).saturating_add(sp_bytes.len());
+                    let sp_end = sp_start.saturating_add(sp_bytes.len());
                     if sp_end > self.red_buf.len() {
                         self.red_buf.resize(sp_end, 0);
                     }
-                    self.red_buf[sp_offset as usize..sp_end].copy_from_slice(&sp_bytes);
+                    self.red_buf[sp_start..sp_end].copy_from_slice(&sp_bytes);
                 } else {
                     break;
                 }
             }
+
+            self.red_buf[start_idx..end_idx].copy_from_slice(data);
+            self.red_received.insert(offset..end);
         } else {
-            // Out of order gap: store in sparse buffer without expanding red_buf with millions of 0 bytes!
-            if self.total_received_bytes.saturating_add(data.len()) > (max_block_size as usize) {
+            // Out of order gap: coalesce with overlapping/adjacent sparse entries so sparse_red
+            // remains disjoint and total_received_bytes tracks unique buffered bytes without leaking.
+            let mut merged_start = offset;
+            let mut merged_end = end;
+            let mut overlapping_keys = Vec::new();
+            let mut existing_bytes = 0usize;
+
+            if let Some((&prev_k, prev_v)) = self.sparse_red.range(..offset).next_back() {
+                let prev_end = prev_k.saturating_add(prev_v.len() as u64);
+                if prev_end >= offset {
+                    merged_start = merged_start.min(prev_k);
+                    merged_end = merged_end.max(prev_end);
+                    overlapping_keys.push(prev_k);
+                    existing_bytes = existing_bytes.saturating_add(prev_v.len());
+                }
+            }
+            for (&k, v) in self.sparse_red.range(offset..=end) {
+                let v_end = k.saturating_add(v.len() as u64);
+                merged_end = merged_end.max(v_end);
+                overlapping_keys.push(k);
+                existing_bytes = existing_bytes.saturating_add(v.len());
+            }
+
+            let Ok(merged_start_idx) = usize::try_from(merged_start) else {
+                return false;
+            };
+            let Ok(merged_end_idx) = usize::try_from(merged_end) else {
+                return false;
+            };
+            let Some(merged_len) = merged_end_idx.checked_sub(merged_start_idx) else {
+                return false;
+            };
+            let new_bytes = merged_len.saturating_sub(existing_bytes);
+            if self.total_received_bytes.saturating_add(new_bytes) > (max_block_size as usize) {
                 return false;
             }
-            self.sparse_red.insert(offset, Bytes::copy_from_slice(data));
-            self.total_received_bytes += data.len();
+
+            let new_chunk = if overlapping_keys.is_empty() {
+                Bytes::copy_from_slice(data)
+            } else {
+                let mut buf = alloc::vec![0u8; merged_len];
+                for key in overlapping_keys {
+                    if let Some(old) = self.sparse_red.remove(&key) {
+                        self.total_received_bytes =
+                            self.total_received_bytes.saturating_sub(old.len());
+                        let rel = (key - merged_start) as usize;
+                        buf[rel..rel + old.len()].copy_from_slice(&old);
+                    }
+                }
+                let rel_new = (offset - merged_start) as usize;
+                buf[rel_new..rel_new + data.len()].copy_from_slice(data);
+                Bytes::from(buf)
+            };
+
+            self.total_received_bytes = self.total_received_bytes.saturating_add(new_chunk.len());
+            self.sparse_red.insert(merged_start, new_chunk);
             self.red_received.insert(offset..end);
         }
         true
@@ -257,5 +317,58 @@ impl RecvSession {
         } else {
             false
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sparse_red_overlapping_out_of_order_does_not_leak_accounting() {
+        let mut sess = RecvSession::new(
+            SessionId {
+                originator: EngineId(1),
+                number: 1,
+            },
+            EngineId(1),
+            1,
+            0,
+            0,
+        );
+
+        // First out-of-order slice [10..20)
+        assert!(sess.insert_red(10, b"0123456789", 64));
+        assert_eq!(sess.total_received_bytes, 10);
+        assert_eq!(sess.sparse_red.len(), 1);
+
+        // Overlapping extension at same offset [10..25)
+        assert!(sess.insert_red(10, b"0123456789abcde", 64));
+        assert_eq!(sess.total_received_bytes, 15);
+        assert_eq!(sess.sparse_red.len(), 1);
+
+        // Overlapping later slice [22..30) coalesces into single disjoint chunk [10..30)
+        assert!(sess.insert_red(22, b"cdefghij", 64));
+        assert_eq!(sess.total_received_bytes, 20);
+        assert_eq!(sess.sparse_red.len(), 1);
+
+        // Another disjoint slice [40..50)
+        assert!(sess.insert_red(40, b"KLMNOPQRST", 64));
+        assert_eq!(sess.total_received_bytes, 30);
+        assert_eq!(sess.sparse_red.len(), 2);
+
+        // Bridge [25..40) connects [10..30) and [40..50)
+        assert!(sess.insert_red(25, b"fghij0123456789", 64));
+        assert_eq!(sess.total_received_bytes, 40);
+        assert_eq!(sess.sparse_red.len(), 1);
+
+        // Fill leading gap [0..10) -> drains entire sparse_red into red_buf
+        assert!(sess.insert_red(0, b"ABCDEFGHIJ", 64));
+        assert_eq!(sess.total_received_bytes, 0);
+        assert!(sess.sparse_red.is_empty());
+        assert_eq!(
+            &sess.red_buf[..50],
+            b"ABCDEFGHIJ0123456789abcdefghij0123456789KLMNOPQRST"
+        );
     }
 }

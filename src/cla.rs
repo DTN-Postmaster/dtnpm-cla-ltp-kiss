@@ -56,6 +56,7 @@ pub fn cla_address_to_engine_id(cla_addr: &ClaAddress) -> Option<EngineId> {
 /// The Licklider Transmission Protocol Convergence Layer Adapter.
 pub struct LtpCla {
     config: Config,
+    allow_unauthenticated_udp: bool,
     inner: Arc<RwLock<Option<ClaInner>>>,
     peer_mappings: Arc<RwLock<HashMap<ClaAddress, EngineId>>>,
     peer_timings: Arc<RwLock<HashMap<EngineId, (Duration, Duration)>>>,
@@ -73,10 +74,20 @@ impl LtpCla {
         }
         Self {
             config,
+            allow_unauthenticated_udp: false,
             inner: Arc::new(RwLock::new(None)),
             peer_mappings: Arc::new(RwLock::new(HashMap::new())),
             peer_timings: Arc::new(RwLock::new(peer_timings)),
         }
+    }
+
+    /// Enables or disables unauthenticated dynamic UDP peer discovery and cross-IP peer migrations.
+    ///
+    /// Disabled by default (`false`) to protect against UDP source spoofing and peer routing hijacks.
+    #[must_use]
+    pub fn with_allow_unauthenticated_udp(mut self, allow: bool) -> Self {
+        self.allow_unauthenticated_udp = allow;
+        self
     }
 
     /// Returns the local bound socket address once registered.
@@ -144,7 +155,10 @@ impl LtpCla {
     /// Unregisters a peer and removes it from the BPA routing table.
     pub async fn unregister_peer(&self, engine_id: EngineId) -> Result<()> {
         let cla_addr = engine_id_to_cla_address(engine_id);
-        self.peer_mappings.write().await.remove(&cla_addr);
+        self.peer_mappings
+            .write()
+            .await
+            .retain(|_, &mut mapped| mapped != engine_id);
         self.peer_timings.write().await.remove(&engine_id);
 
         let inner_guard = self.inner.read().await;
@@ -217,6 +231,7 @@ impl Cla for LtpCla {
         let tasks = Arc::new(TaskPool::new());
         let driver_handle = Driver::spawn(
             self.config.clone(),
+            self.allow_unauthenticated_udp,
             sink.clone(),
             cmd_rx,
             addr_tx,
