@@ -22,6 +22,14 @@ Requires sibling checkouts of `../dtnpm-core` and `../../hardy/*` as referenced 
 cargo test --workspace --exclude dtnpm-cla-ltp-kiss-fuzz --exclude hardy-ltp-fuzz
 ```
 
+## Security & Compliance
+
+- **Cyber Resilience Act (CRA)**: Secure-by-default UDP peering (`static_peers` enforced, dynamic map capped to 256 peers), VEX audit documentation (`RUSTSEC-2026-0459`), and SHA-pinned CI actions.
+- **Explicit Permissive Mode (Opt-in)**: Unauthenticated UDP ingestion or dynamic IP migration requires explicit user activation via `--allow-unauthenticated-udp` or `allow_unauthenticated_udp = true`.
+- **Resource Bounds & Protocol Safety**: Chunked `BTreeMap` green reassembly with strict contiguous boundary validation (32 MiB max cap), bounded receive sessions (1,024 slots), `sparse_red` coalescing, and safe KISS framing (`0xFF` padding).
+- **Rust Quality Standards**: 100% `unwrap`-free and `panic!`-free production codebase.
+- **Documentation**: See [`AGENTS.md`](AGENTS.md), [`CONTRIBUTING.md`](CONTRIBUTING.md), [`SECURITY.md`](SECURITY.md), and Architectural Decision Records in [`adr/`](adr/).
+
 ## License
 
 Dual-licensed under the Apache License, Version 2.0 or the MIT License. See [LICENSE.md](LICENSE.md).
