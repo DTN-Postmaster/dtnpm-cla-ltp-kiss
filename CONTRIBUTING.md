@@ -1,21 +1,21 @@
-# Guide de Contribution — `dtnpm-cla-ltp-kiss`
+# Contributing Guide — `dtnpm-cla-ltp-kiss`
 
-Ce guide présente les règles de développement et les exigences de sécurité pour le CLA LTP et KISS de `dtnpm-cla-ltp-kiss`.
-
----
-
-## 1. Principes Fondamentaux
-
-- **Zéro Panic / Zéro Unwrap** : Aucun appel `.unwrap()` ou `.expect()` en code de production.
-- **Sécurité et Bornage des Ressources** :
-  - L'authentification des pairs UDP est obligatoire par défaut (`static_peers`), avec opt-in explicite (`--allow-unauthenticated-udp`) réservé aux usages volontaires.
-  - Tout réassemblage de segments réseau doit être borné en mémoire et valider la contiguïté stricte avant transmission au BPA.
-- **Traçabilité Architecturale (ADR)** :
-  - Tout ajout ou ajustement protocolaire doit faire l'objet d'un fichier ADR sous `adr/` et être indexé dans `adr/README.md`.
+This guide outlines the development rules and security requirements for the LTP and KISS CLA in `dtnpm-cla-ltp-kiss`.
 
 ---
 
-## 2. Vérification Locale
+## 1. Core Principles
+
+- **Zero Panic / Zero Unwrap**: No `.unwrap()` or `.expect()` calls in production code.
+- **Resource Bounds and Security**:
+  - UDP peer authentication is mandatory by default (`static_peers`), with explicit opt-in (`--allow-unauthenticated-udp`) reserved for intentional use.
+  - All network segment reassembly must be memory-bounded and validate strict contiguity before delivery to the BPA.
+- **Architectural Traceability (ADR)**:
+  - Any protocol addition or adjustment must be documented in an ADR file under `adr/` and indexed in `adr/README.md`.
+
+---
+
+## 2. Local Verification
 
 ```bash
 cargo fmt --all -- --check
