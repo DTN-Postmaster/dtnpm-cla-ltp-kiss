@@ -220,12 +220,19 @@ jobs:
           unzip -q /tmp/protoc.zip -d "$HOME/.local/protoc"
       - name: Add protoc to PATH
         run: echo "$HOME/.local/protoc/bin" >> "$GITHUB_PATH"
-      - uses: taiki-e/install-action@82fc405565b9cf90abfe700ba43b4751ce2fe422 # cargo-fuzz
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Cache cargo-fuzz
+        id: cargo-fuzz-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-fuzz
+          key: cargo-fuzz-linux-x86_64-v1
+      - name: Install cargo-fuzz (cache miss)
+        if: steps.cargo-fuzz-cache.outputs.cache-hit != 'true'
+        run: cargo install cargo-fuzz --locked
       - name: Run fuzz targets (smoke tests)
         working-directory: dtn-postmaster/dtnpm-cla-ltp-kiss
         run: |
+          sudo sysctl -w vm.mmap_rnd_bits=28
           cargo fuzz run --fuzz-dir fuzz cla_packet -- -max_total_time=30
           cargo fuzz run --fuzz-dir ltp/fuzz engine_ops -- -max_total_time=30
           cargo fuzz run --fuzz-dir ltp/fuzz sdnv_kiss -- -max_total_time=30
