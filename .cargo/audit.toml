@@ -1,5 +1,2 @@
 [advisories]
-ignore = [
-    # VEX: libsqlite3-sys < 0.39.0 (CVE-2026-119375, FTS5/WAL DoS) is pulled in transitively via dtnpm-core -> rusqlite 0.40.2 -> libsqlite3-sys 0.38.2; this CLA process never opens untrusted SQLite+WAL databases.
-    "RUSTSEC-2026-0459",
-]
+ignore = []

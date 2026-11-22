@@ -127,13 +127,19 @@ pub enum TransportMode {
         /// Initial reconnect delay on connection loss (default 500ms).
         #[cfg_attr(
             feature = "serde",
-            serde(default = "default_reconnect_initial", with = "humantime_duration")
+            serde(
+                default = "default_reconnect_initial",
+                with = "dtnpm_core::duration::serde_duration"
+            )
         )]
         reconnect_initial_delay: Duration,
         /// Maximum reconnect delay with exponential backoff (default 30s).
         #[cfg_attr(
             feature = "serde",
-            serde(default = "default_reconnect_max", with = "humantime_duration")
+            serde(
+                default = "default_reconnect_max",
+                with = "dtnpm_core::duration::serde_duration"
+            )
         )]
         reconnect_max_delay: Duration,
         /// Minimum frame length in bytes required by the underlying TNC (e.g. 15 for Direwolf).
@@ -156,13 +162,19 @@ pub enum TransportMode {
         /// Maximum timeout to wait for Report Segment before unblocking in `WaitForReport` mode (default: 3s).
         #[cfg_attr(
             feature = "serde",
-            serde(default = "default_turnaround_timeout", with = "humantime_duration")
+            serde(
+                default = "default_turnaround_timeout",
+                with = "dtnpm_core::duration::serde_duration"
+            )
         )]
         turnaround_timeout: Duration,
         /// Fixed quiet / dwell duration after each Checkpoint in `FixedDwell` mode (default: 500ms).
         #[cfg_attr(
             feature = "serde",
-            serde(default = "default_dwell_time", with = "humantime_duration")
+            serde(
+                default = "default_dwell_time",
+                with = "dtnpm_core::duration::serde_duration"
+            )
         )]
         dwell_time: Duration,
     },
@@ -290,13 +302,16 @@ pub struct Config {
     /// Estimated Round-Trip Time.
     #[cfg_attr(
         feature = "serde",
-        serde(default = "default_rtt", with = "humantime_duration")
+        serde(default = "default_rtt", with = "dtnpm_core::duration::serde_duration")
     )]
     pub rtt: Duration,
     /// Remote acknowledgement processing margin.
     #[cfg_attr(
         feature = "serde",
-        serde(default = "default_ack_margin", with = "humantime_duration")
+        serde(
+            default = "default_ack_margin",
+            with = "dtnpm_core::duration::serde_duration"
+        )
     )]
     pub ack_margin: Duration,
     /// Checkpoint retransmission limit before cancellation.
@@ -324,21 +339,6 @@ impl Default for Config {
             report_rtx_limit: default_rtx_limit(),
             peers: Vec::new(),
         }
-    }
-}
-
-#[cfg(feature = "serde")]
-mod humantime_duration {
-    use serde::{Deserialize, Deserializer, Serializer};
-    use std::time::Duration;
-
-    pub fn serialize<S: Serializer>(duration: &Duration, s: S) -> Result<S::Ok, S::Error> {
-        s.collect_str(&humantime::format_duration(*duration))
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Duration, D::Error> {
-        let text = String::deserialize(d)?;
-        humantime::parse_duration(&text).map_err(serde::de::Error::custom)
     }
 }
 
