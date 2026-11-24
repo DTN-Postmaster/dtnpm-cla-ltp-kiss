@@ -2965,6 +2965,9 @@ async fn test_udp_dynamic_peer_cap_256_evicts_oldest() {
     let local_addr = cla.local_addr().await.unwrap();
 
     let client_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    // 260 dynamic discoveries -> oldest 4 (1000..1004) must be evicted to enforce 256 cap.
+    // Await each add_peer before sending the next datagram so loopback UDP doesn't drop packets
+    // under instrumentation and insertion order remains deterministic.
     for engine_num in 1000..1260u64 {
         let seg = LtpSegment {
             session: SessionId {
@@ -2984,10 +2987,6 @@ async fn test_udp_dynamic_peer_cap_256_evicts_oldest() {
             .send_to(&seg.encode_to_vec(), local_addr)
             .await
             .unwrap();
-    }
-
-    // 260 dynamic discoveries -> oldest 4 (1000..1004) must be evicted to enforce 256 cap
-    for _ in 0..260 {
         tokio::time::timeout(Duration::from_secs(5), add_rx.recv())
             .await
             .expect("timeout waiting for add_peer")
